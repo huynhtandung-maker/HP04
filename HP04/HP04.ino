@@ -44,8 +44,10 @@
 #include "esp_system.h"
 
 #include "config.h"
-#include "secrets.h"
 
+#if USE_LOCAL_SECRETS
+  #include "secrets.h"
+#endif
 
 
 // ================================================================================
@@ -54,6 +56,27 @@
 
 Preferences preferences;
 
+// Preferences riêng để lưu cấu hình runtime: WiFi + ThingsBoard.
+// Khác với preferences đang dùng để lưu peopleCount, bootCount.
+Preferences configPrefs;
+
+// Cấu hình WiFi/ThingsBoard được dùng khi thiết bị chạy.
+// Ban đầu rỗng, sau đó sẽ được nạp từ NVS hoặc secrets.h.
+String cfgWifiSsid = "";
+String cfgWifiPassword = "";
+
+String cfgTbHost = DEFAULT_TB_HOST;
+int cfgTbPort = DEFAULT_TB_PORT;
+String cfgTbToken = "";
+
+// Có cấu hình hợp lệ hay chưa.
+bool hasRuntimeConfig = false;
+
+// Sau này dùng cho Setup Portal.
+bool setupPortalActive = false;
+
+// Ghi nhận thời điểm bắt đầu thử kết nối WiFi.
+unsigned long wifiConnectStartedAt = 0;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -108,6 +131,9 @@ void showBootScreen(const String& line1, const String& line2);
 void maintainWiFi(unsigned long now);
 void maintainMqtt(unsigned long now);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
+void loadRuntimeConfig();
+bool isRuntimeConfigValid();
+void printRuntimeConfigStatus();
 
 long readDistanceCm();
 void readDhtIfDue(unsigned long now);
@@ -131,6 +157,64 @@ bool performOtaUpdate(const String& url, const String& targetVersion);
 
 void setBuzzer(bool on);
 
+
+// ================================================================================
+// 12A. RUNTIME CONFIG - WIFI / THINGSBOARD
+// ================================================================================
+
+bool isRuntimeConfigValid() {
+  return cfgWifiSsid.length() > 0 && cfgTbToken.length() > 0;
+}
+
+void loadRuntimeConfig() {
+  configPrefs.begin(CFG_NAMESPACE, false);
+
+  // 1. Thử đọc cấu hình đã lưu trong Preferences/NVS.
+  cfgWifiSsid     = configPrefs.getString("wifi_ssid", "");
+  cfgWifiPassword = configPrefs.getString("wifi_pass", "");
+  cfgTbHost       = configPrefs.getString("tb_host", DEFAULT_TB_HOST);
+  cfgTbPort       = configPrefs.getInt("tb_port", DEFAULT_TB_PORT);
+  cfgTbToken      = configPrefs.getString("tb_token", "");
+
+#if USE_LOCAL_SECRETS
+  // 2. Giai đoạn chuyển tiếp:
+  // Nếu NVS chưa có WiFi/token, dùng secrets.h làm nguồn dự phòng.
+  // Cách này giúp code vẫn chạy trong lúc ta chưa làm Setup Portal.
+  if (!isRuntimeConfigValid()) {
+    cfgWifiSsid     = WIFI_SSID;
+    cfgWifiPassword = WIFI_PASSWORD;
+    cfgTbHost       = TB_HOST;
+    cfgTbPort       = TB_PORT;
+    cfgTbToken      = TB_TOKEN;
+  }
+#endif
+
+  hasRuntimeConfig = isRuntimeConfigValid();
+}
+
+void printRuntimeConfigStatus() {
+  Serial.println(F("[CFG] Runtime config status"));
+
+  Serial.print(F("[CFG] WiFi SSID: "));
+  if (cfgWifiSsid.length() > 0) {
+    Serial.println(cfgWifiSsid);
+  } else {
+    Serial.println(F("(empty)"));
+  }
+
+  Serial.print(F("[CFG] ThingsBoard host: "));
+  Serial.println(cfgTbHost);
+
+  Serial.print(F("[CFG] ThingsBoard port: "));
+  Serial.println(cfgTbPort);
+
+  Serial.print(F("[CFG] ThingsBoard token: "));
+  Serial.println(cfgTbToken.length() > 0 ? F("SET") : F("EMPTY"));
+
+  Serial.print(F("[CFG] Has runtime config: "));
+  Serial.println(hasRuntimeConfig ? F("YES") : F("NO"));
+}
+
 // ================================================================================
 // 13. SETUP
 // ================================================================================
@@ -145,6 +229,8 @@ void setup() {
   peopleCount = preferences.getInt("peopleCount", 0);
   bootCount = preferences.getUInt("bootCount", 0) + 1;
   preferences.putUInt("bootCount", bootCount);
+  loadRuntimeConfig();
+  printRuntimeConfigStatus();
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
@@ -172,10 +258,15 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  lastWifiAttempt = millis();
+  if (hasRuntimeConfig) {
+  WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
+  wifiConnectStartedAt = millis();
+  lastWifiAttempt = wifiConnectStartedAt;
+  } else {
+  Serial.println(F("[CFG] Chua co WiFi/token. Setup Portal se duoc them o buoc tiep theo."));
+  }
 
-  client.setServer(TB_HOST, TB_PORT);
+  client.setServer(cfgTbHost.c_str(), cfgTbPort);
   client.setCallback(mqttCallback);
   client.setBufferSize(MQTT_BUFFER_SIZE);
   client.setKeepAlive(30);
@@ -257,6 +348,7 @@ void loop() {
 // ================================================================================
 
 void maintainWiFi(unsigned long now) {
+  if (!hasRuntimeConfig) return;
   if (WiFi.status() == WL_CONNECTED) return;
 
   if (now - lastWifiAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
@@ -264,11 +356,12 @@ void maintainWiFi(unsigned long now) {
     Serial.println(F("[WiFi] Mat ket noi. Thu ket noi lai..."));
 
     WiFi.disconnect(false, false);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
   }
 }
 
 void maintainMqtt(unsigned long now) {
+  if (!hasRuntimeConfig) return;
   if (WiFi.status() != WL_CONNECTED) return;
 
   if (client.connected()) {
@@ -284,7 +377,7 @@ void maintainMqtt(unsigned long now) {
 
   Serial.println(F("[MQTT] Thu ket noi ThingsBoard..."));
 
-  if (client.connect(clientId.c_str(), TB_TOKEN, "")) {
+  if (client.connect(clientId.c_str(), cfgTbToken.c_str(), "")) {
     Serial.println(F("[MQTT] Connected ThingsBoard"));
 
     client.subscribe("v1/devices/me/rpc/request/+");
