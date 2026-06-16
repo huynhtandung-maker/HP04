@@ -51,6 +51,24 @@
 
 
 // ================================================================================
+// SAFE DEFAULTS CHO BẢN v1.2.0-dev
+// Các macro này chỉ có hiệu lực nếu config.h chưa khai báo.
+// ================================================================================
+
+#ifndef MQTT_AUTH_FAIL_LIMIT
+  #define MQTT_AUTH_FAIL_LIMIT 3
+#endif
+
+#ifndef AUTO_PORTAL_ON_MQTT_AUTH_FAIL
+  #define AUTO_PORTAL_ON_MQTT_AUTH_FAIL 1
+#endif
+
+#ifndef MQTT_CLIENT_ID_PREFIX
+  #define MQTT_CLIENT_ID_PREFIX "HP04"
+#endif
+
+
+// ================================================================================
 // 10. OBJECTS
 // ================================================================================
 
@@ -119,6 +137,9 @@ unsigned long lastMqttSend = 0;
 
 unsigned long scheduledRestartAt = 0;
 
+// Đếm số lần ThingsBoard từ chối credential để tự mở Setup Portal hỗ trợ nhập lại token.
+uint8_t mqttAuthFailCount = 0;
+
 // OTA pending do RPC đặt cờ, không chạy trực tiếp trong callback MQTT.
 bool otaPending = false;
 bool otaRunning = false;
@@ -136,7 +157,36 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void loadRuntimeConfig();
 bool isRuntimeConfigValid();
 void printRuntimeConfigStatus();
+String stripInvisibleCredential(String s);
+void normalizeThingsBoardEndpoint();
+String tokenFingerprint(const String& token);
+String buildMqttClientId();
+bool tryThingsBoardMqttConnect(const String& clientId);
+void logMqttState(int st);
+void testThingsBoardTcp() {
+  static unsigned long lastProbe = 0;
+  unsigned long now = millis();
 
+  if (now - lastProbe < 30000) return;
+  lastProbe = now;
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClient probe;
+
+  Serial.print(F("[NET] TCP probe "));
+  Serial.print(cfgTbHost);
+  Serial.print(F(":"));
+  Serial.print(cfgTbPort);
+  Serial.print(F(" ... "));
+
+  if (probe.connect(cfgTbHost.c_str(), cfgTbPort)) {
+    Serial.println(F("OK"));
+    probe.stop();
+  } else {
+    Serial.println(F("FAIL"));
+  }
+}
 String getSetupApName();
 void startSetupPortal();
 void maintainSetupPortal();
@@ -170,6 +220,107 @@ void setBuzzer(bool on);
 // 12A. RUNTIME CONFIG - WIFI / THINGSBOARD
 // ================================================================================
 
+String stripInvisibleCredential(String s) {
+  // Dùng cho host/token: loại bỏ khoảng trắng, xuống dòng, tab, ký tự điều khiển.
+  // Không dùng cho WiFi password vì password WiFi có thể hợp lệ với ký tự đặc biệt.
+  String out = "";
+  out.reserve(s.length());
+
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c > 32 && c < 127) {
+      out += c;
+    }
+  }
+
+  out.trim();
+  return out;
+}
+
+void normalizeThingsBoardEndpoint() {
+  cfgTbHost = stripInvisibleCredential(cfgTbHost);
+
+  // Cho phép người dùng lỡ nhập dạng URL đầy đủ trong portal.
+  if (cfgTbHost.startsWith("https://")) {
+    cfgTbHost = cfgTbHost.substring(8);
+  } else if (cfgTbHost.startsWith("http://")) {
+    cfgTbHost = cfgTbHost.substring(7);
+  }
+
+  int slash = cfgTbHost.indexOf('/');
+  if (slash >= 0) {
+    cfgTbHost = cfgTbHost.substring(0, slash);
+  }
+
+  // Cho phép nhập host dạng thingsboard.cloud:1883.
+  int colon = cfgTbHost.indexOf(':');
+  if (colon > 0) {
+    int parsedPort = cfgTbHost.substring(colon + 1).toInt();
+    if (parsedPort > 0) {
+      cfgTbPort = parsedPort;
+    }
+    cfgTbHost = cfgTbHost.substring(0, colon);
+  }
+
+  if (cfgTbHost.length() == 0) cfgTbHost = DEFAULT_TB_HOST;
+  if (cfgTbPort <= 0) cfgTbPort = DEFAULT_TB_PORT;
+}
+
+String tokenFingerprint(const String& token) {
+  // Không in token thật ra Serial. Chỉ in độ dài + đầu/cuối để đối chiếu.
+  if (token.length() == 0) return "EMPTY";
+
+  String head = token.substring(0, min((int)token.length(), 3));
+  String tail = token.length() > 3 ? token.substring(token.length() - min((int)token.length(), 3)) : "";
+
+  uint16_t hash = 0;
+  for (size_t i = 0; i < token.length(); i++) {
+    hash = (hash * 31) + token.charAt(i);
+  }
+
+  return "len=" + String(token.length()) + " " + head + "***" + tail + " h=" + String(hash, HEX);
+}
+
+String buildMqttClientId() {
+  // Giữ clientId ngắn, sạch, tránh trường hợp broker từ chối clientId quá dài/ký tự lạ.
+  uint32_t chipId = (uint32_t)ESP.getEfuseMac();
+  String suffix = String(chipId, HEX);
+  suffix.toUpperCase();
+
+  if (suffix.length() > 6) {
+    suffix = suffix.substring(suffix.length() - 6);
+  }
+
+  return String(MQTT_CLIENT_ID_PREFIX) + "_" + suffix;
+}
+
+bool tryThingsBoardMqttConnect(const String& clientId) {
+  // ThingsBoard Access Token phải đi vào MQTT username, password để NULL.
+  // Đây là mode chính thức cho credential type "Access token".
+  return client.connect(clientId.c_str(), cfgTbToken.c_str(), NULL);
+}
+
+void logMqttState(int st) {
+  Serial.print(F("[MQTT] Loi ket noi, state="));
+  Serial.println(st);
+
+  if (st == MQTT_CONNECT_BAD_PROTOCOL) {
+    Serial.println(F("[MQTT] Sai protocol MQTT."));
+  } else if (st == MQTT_CONNECT_BAD_CLIENT_ID) {
+    Serial.println(F("[MQTT] Client ID bi tu choi. Da dung clientId ngan de tranh loi nay."));
+  } else if (st == MQTT_CONNECT_UNAVAILABLE) {
+    Serial.println(F("[MQTT] Server unavailable."));
+  } else if (st == MQTT_CONNECT_BAD_CREDENTIALS) {
+    Serial.println(F("[MQTT] Credential sai. Hay copy lai Access Token cua device HP-04."));
+  } else if (st == MQTT_CONNECT_UNAUTHORIZED) {
+    Serial.println(F("[MQTT] Token khong duoc phep. Mo Setup Portal va nhap lai Access Token cua DUNG device HP-04."));
+  } else if (st == MQTT_CONNECTION_TIMEOUT) {
+    Serial.println(F("[MQTT] Timeout. Neu TCP OK ma MQTT timeout, thu tang socket timeout/doi WiFi hotspot."));
+  } else {
+    Serial.println(F("[MQTT] Loi khong xac dinh."));
+  }
+}
+
 bool isRuntimeConfigValid() {
   return cfgWifiSsid.length() > 0 && cfgTbToken.length() > 0;
 }
@@ -183,6 +334,12 @@ void loadRuntimeConfig() {
   cfgTbHost       = configPrefs.getString("tb_host", DEFAULT_TB_HOST);
   cfgTbPort       = configPrefs.getInt("tb_port", DEFAULT_TB_PORT);
   cfgTbToken      = configPrefs.getString("tb_token", "");
+
+  // Làm sạch dữ liệu đọc từ NVS để tránh lỗi MQTT do dính khoảng trắng/ký tự xuống dòng.
+  cfgWifiSsid.trim();
+  cfgWifiPassword.trim();
+  cfgTbToken = stripInvisibleCredential(cfgTbToken);
+  normalizeThingsBoardEndpoint();
 
 #if USE_LOCAL_SECRETS
   // 2. Giai đoạn chuyển tiếp:
@@ -218,6 +375,9 @@ void printRuntimeConfigStatus() {
 
   Serial.print(F("[CFG] ThingsBoard token: "));
   Serial.println(cfgTbToken.length() > 0 ? F("SET") : F("EMPTY"));
+
+  Serial.print(F("[CFG] Token fingerprint: "));
+  Serial.println(tokenFingerprint(cfgTbToken));
 
   Serial.print(F("[CFG] Has runtime config: "));
   Serial.println(hasRuntimeConfig ? F("YES") : F("NO"));
@@ -333,12 +493,19 @@ void handleSetupSave() {
 
   ssid.trim();
   pass.trim();
-  host.trim();
-  portText.trim();
-  token.trim();
+  host = stripInvisibleCredential(host);
+  portText = stripInvisibleCredential(portText);
+  token = stripInvisibleCredential(token);
 
   int port = portText.toInt();
   if (port <= 0) port = DEFAULT_TB_PORT;
+
+  // Chuẩn hóa nếu người dùng nhập nhầm host dạng URL hoặc host:port.
+  cfgTbHost = host;
+  cfgTbPort = port;
+  normalizeThingsBoardEndpoint();
+  host = cfgTbHost;
+  port = cfgTbPort;
 
   if (ssid.length() == 0 || token.length() < 5) {
     setupServer.send(400, "text/plain", "Missing WiFi SSID or ThingsBoard token");
@@ -350,6 +517,15 @@ void handleSetupSave() {
   configPrefs.putString("tb_host", host.length() > 0 ? host : DEFAULT_TB_HOST);
   configPrefs.putInt("tb_port", port);
   configPrefs.putString("tb_token", token);
+
+  Serial.print(F("[SETUP] Saved WiFi SSID: "));
+  Serial.println(ssid);
+  Serial.print(F("[SETUP] Saved TB host: "));
+  Serial.print(host);
+  Serial.print(F(":"));
+  Serial.println(port);
+  Serial.print(F("[SETUP] Saved token fingerprint: "));
+  Serial.println(tokenFingerprint(token));
 
   setupServer.send(
     200,
@@ -410,20 +586,25 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  if (hasRuntimeConfig) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
-  wifiConnectStartedAt = millis();
-  lastWifiAttempt = wifiConnectStartedAt;
-} else {
-  startSetupPortal();
-}
+  if (FORCE_SETUP_PORTAL) {
+    startSetupPortal();
+  } else if (hasRuntimeConfig) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
+    wifiConnectStartedAt = millis();
+    lastWifiAttempt = wifiConnectStartedAt;
+  } else {
+    startSetupPortal();
+  }
 
   client.setServer(cfgTbHost.c_str(), cfgTbPort);
   client.setCallback(mqttCallback);
   client.setBufferSize(MQTT_BUFFER_SIZE);
-  client.setKeepAlive(30);
-  client.setSocketTimeout(3);
+
+  // ThingsBoard Cloud đôi khi phản hồi MQTT chậm hơn 3 giây.
+  // Tăng timeout để giảm lỗi MQTT state=-4.
+  client.setKeepAlive(60);
+  client.setSocketTimeout(12);
 
   Serial.println();
   Serial.println(F("======================================"));
@@ -443,6 +624,13 @@ void loop() {
   unsigned long now = millis();
 
   maintainSetupPortal();
+
+  // Khi đang ở Setup Portal thì chỉ phục vụ web cấu hình,
+  // không chạy WiFi/MQTT để tránh rối trạng thái.
+  if (setupPortalActive) {
+    delay(5);
+    return;
+  }
 
   maintainWiFi(now);
   maintainMqtt(now);
@@ -520,19 +708,58 @@ void maintainMqtt(unsigned long now) {
   if (WiFi.status() != WL_CONNECTED) return;
 
   if (client.connected()) {
+    mqttAuthFailCount = 0;
     client.loop();
     return;
   }
 
   if (now - lastMqttAttempt < MQTT_RECONNECT_INTERVAL_MS) return;
-
   lastMqttAttempt = now;
 
-  String clientId = String(FW_TITLE) + "_" + String((uint32_t)ESP.getEfuseMac(), HEX) + "_" + String(random(0xffff), HEX);
+  cfgTbToken = stripInvisibleCredential(cfgTbToken);
+  normalizeThingsBoardEndpoint();
 
-  Serial.println(F("[MQTT] Thu ket noi ThingsBoard..."));
+  if (cfgTbToken.length() < 10) {
+    Serial.println(F("[MQTT] Khong ket noi: ThingsBoard token trong NVS dang rong/sai."));
+    Serial.println(F("[MQTT] Hay vao Setup Portal nhap lai Access Token cua device HP-04."));
+    return;
+  }
 
-  if (client.connect(clientId.c_str(), cfgTbToken.c_str(), "")) {
+  Serial.print(F("[MQTT] Host: "));
+  Serial.print(cfgTbHost);
+  Serial.print(F(":"));
+  Serial.print(cfgTbPort);
+  Serial.print(F(" | token "));
+  Serial.println(tokenFingerprint(cfgTbToken));
+
+  // Kiểm tra TCP trước để phân biệt lỗi mạng/port với lỗi MQTT/token.
+  WiFiClient probe;
+  Serial.print(F("[MQTT] TCP probe... "));
+  if (!probe.connect(cfgTbHost.c_str(), cfgTbPort)) {
+    Serial.println(F("FAIL"));
+    Serial.println(F("[MQTT] Khong mo duoc TCP toi ThingsBoard. Kiem tra WiFi/port 1883/mang co chan MQTT khong."));
+    probe.stop();
+    return;
+  }
+  Serial.println(F("OK"));
+  probe.stop();
+
+  // Dọn socket cũ trước khi mở kết nối mới.
+  client.disconnect();
+  espClient.stop();
+  delay(80);
+
+  client.setServer(cfgTbHost.c_str(), cfgTbPort);
+
+  String clientId = buildMqttClientId();
+
+  Serial.print(F("[MQTT] ClientId: "));
+  Serial.println(clientId);
+  Serial.println(F("[MQTT] Thu ket noi ThingsBoard bang Access Token..."));
+
+  if (tryThingsBoardMqttConnect(clientId)) {
+    mqttAuthFailCount = 0;
+
     Serial.println(F("[MQTT] Connected ThingsBoard"));
 
     client.subscribe("v1/devices/me/rpc/request/+");
@@ -540,10 +767,27 @@ void maintainMqtt(unsigned long now) {
     publishDeviceAttributes();
     needInstantSync = true;
   } else {
-    Serial.print(F("[MQTT] Loi ket noi, state="));
-    Serial.println(client.state());
+    int st = client.state();
+    logMqttState(st);
+
+    if (st == MQTT_CONNECT_BAD_CREDENTIALS || st == MQTT_CONNECT_UNAUTHORIZED) {
+      mqttAuthFailCount++;
+
+      Serial.print(F("[MQTT] Auth fail count: "));
+      Serial.print(mqttAuthFailCount);
+      Serial.print(F("/"));
+      Serial.println(MQTT_AUTH_FAIL_LIMIT);
+
+#if AUTO_PORTAL_ON_MQTT_AUTH_FAIL
+      if (mqttAuthFailCount >= MQTT_AUTH_FAIL_LIMIT && !setupPortalActive) {
+        Serial.println(F("[MQTT] Qua nhieu lan bi tu choi token. Tu mo Setup Portal de nhap lai credential."));
+        startSetupPortal();
+      }
+#endif
+    }
   }
 }
+
 
 // ================================================================================
 // 16. MQTT RPC CALLBACK

@@ -171,7 +171,7 @@ const unsigned long LOOP_IDLE_DELAY_MS = 5;
 // Giai đoạn phát triển:
 // 1 = nếu NVS chưa có config thì dùng secrets.h dự phòng.
 // 0 = firmware sạch secret, nếu chưa có config thì mở Setup Portal.
-#define USE_LOCAL_SECRETS 1
+#define USE_LOCAL_SECRETS 0
 
 // Namespace lưu cấu hình runtime trong Preferences/NVS
 #define CFG_NAMESPACE "hp04_cfg"
@@ -188,6 +188,11 @@ const unsigned long LOOP_IDLE_DELAY_MS = 5;
 
 // Web portal chạy tại http://192.168.4.1
 #define SETUP_PORTAL_PORT 80
+
+// Ép mở Setup Portal để test.
+// 0 = chạy bình thường
+// 1 = luôn mở HP04-SETUP để test portal
+#define FORCE_SETUP_PORTAL 0
 
 // Nếu sau này WiFi lỗi quá lâu thì mở setup portal
 const unsigned long WIFI_FAIL_TO_SETUP_MS = 60000; // 60 giây
