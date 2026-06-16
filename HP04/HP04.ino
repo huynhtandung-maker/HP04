@@ -8,7 +8,7 @@
   OTA     : ThingsBoard RPC -> ESP32 tải firmware .bin từ GitHub raw URL
 
   PHIÊN BẢN:
-  - v1.1.0
+  - v1.2.0-dev
   - Giữ logic gốc: siêu âm đếm người, DHT11, NeoPixel, buzzer, OLED, Preferences.
   - Nâng cấp:
     1. Không còn chờ WiFi vô hạn trong setup.
@@ -33,6 +33,24 @@
 #include <Update.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+
+// ------------------------------------------------------------------------------
+// v1.2.0-dev dashboard/RPC hardening
+// ------------------------------------------------------------------------------
+// DHT11 đôi khi trả giá trị rác ở vài giây đầu hoặc khi dây lỏng.
+// Các ngưỡng này giúp không đẩy số 0.50°C / 0% RH lên ThingsBoard.
+#ifndef DHT_VALID_TEMP_MIN_C
+#define DHT_VALID_TEMP_MIN_C 5.0
+#endif
+#ifndef DHT_VALID_TEMP_MAX_C
+#define DHT_VALID_TEMP_MAX_C 60.0
+#endif
+#ifndef DHT_VALID_HUM_MIN
+#define DHT_VALID_HUM_MIN 1.0
+#endif
+#ifndef DHT_VALID_HUM_MAX
+#define DHT_VALID_HUM_MAX 100.0
+#endif
 
 #include <Adafruit_NeoPixel.h>
 #include <DHT.h>
@@ -140,6 +158,11 @@ unsigned long scheduledRestartAt = 0;
 // Đếm số lần ThingsBoard từ chối credential để tự mở Setup Portal hỗ trợ nhập lại token.
 uint8_t mqttAuthFailCount = 0;
 
+// Biến phục vụ UX dashboard: mỗi lần bấm RPC sẽ tăng số thứ tự.
+// Nhờ vậy người dùng nhìn HTML dashboard biết chắc lệnh vừa được thiết bị nhận và xử lý.
+uint32_t rpcUiSeq = 0;
+uint32_t syncUiSeq = 0;
+
 // OTA pending do RPC đặt cờ, không chạy trực tiếp trong callback MQTT.
 bool otaPending = false;
 bool otaRunning = false;
@@ -195,9 +218,12 @@ void handleSetupSave();
 
 long readDistanceCm();
 void readDhtIfDue(unsigned long now);
+bool isDhtReadingPlausible(float t, float h);
 void updateCounterLogic(long rawDistance, unsigned long now);
 void updateLedAndBuzzer(unsigned long now);
 void sendTelemetryIfDue(unsigned long now);
+bool publishStatusTelemetry(const char* reason, bool force);
+void publishRpcUiEvent(const char* method, const char* status, const char* message, const char* source);
 void publishDeviceAttributes();
 void publishOtaStatus(const String& status, const String& version, const String& detail);
 
@@ -206,7 +232,7 @@ void drawMainPage();
 void drawStatusPage();
 void drawCenteredText(const String& text, int y, uint8_t size);
 
-void sendRpcResponse(const String& requestId, const String& response);
+bool sendRpcResponse(const String& requestId, const String& response);
 String extractRequestId(const String& topic);
 String jsonEscape(String s);
 String resetReasonToText();
@@ -765,6 +791,7 @@ void maintainMqtt(unsigned long now) {
     client.subscribe("v1/devices/me/rpc/request/+");
 
     publishDeviceAttributes();
+    publishRpcUiEvent("boot", "READY", "Device online and ready for RPC", "MQTT:connected");
     needInstantSync = true;
   } else {
     int st = client.state();
@@ -860,6 +887,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     sendRpcResponse(requestId, resp);
 
     publishOtaStatus("SCHEDULED", version, "OTA scheduled by ThingsBoard RPC");
+    publishRpcUiEvent("otaUpdate", "SCHEDULED", "OTA command accepted", "RPC:otaUpdate");
     return;
   }
 
@@ -873,7 +901,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     preferences.putInt("peopleCount", peopleCount);
     needInstantSync = true;
 
-    sendRpcResponse(requestId, "{\"ok\":true,\"peopleCount\":0}");
+    bool rpcOk = sendRpcResponse(requestId, "{\"ok\":true,\"peopleCount\":0}");
+    bool snapshotOk = publishStatusTelemetry("rpc_resetCounter", true);
+    publishRpcUiEvent("resetCounter", (rpcOk && snapshotOk) ? "OK" : "FAILED",
+                      snapshotOk ? "Counter reset and snapshot refreshed" : "Counter reset but snapshot failed",
+                      "RPC:resetCounter");
     return;
   }
 
@@ -901,7 +933,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     needInstantSync = true;
 
     String resp = String("{\"ok\":true,\"peopleCount\":") + String(peopleCount) + "}";
-    sendRpcResponse(requestId, resp);
+    bool rpcOk = sendRpcResponse(requestId, resp);
+    bool snapshotOk = publishStatusTelemetry("rpc_setCounter", true);
+    publishRpcUiEvent("setCounter", (rpcOk && snapshotOk) ? "OK" : "FAILED",
+                      snapshotOk ? "Counter updated and snapshot refreshed" : "Counter updated but snapshot failed",
+                      "RPC:setCounter");
     return;
   }
 
@@ -911,7 +947,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // {"method":"restart","params":{}}
   // --------------------------------------------------------------------------
   if (method == "restart") {
-    sendRpcResponse(requestId, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
+    bool rpcOk = sendRpcResponse(requestId, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
+    publishRpcUiEvent("restart", rpcOk ? "SCHEDULED" : "FAILED",
+                      rpcOk ? "Restart scheduled" : "Restart response failed",
+                      "RPC:restart");
     scheduledRestartAt = millis() + 1500;
     return;
   }
@@ -925,20 +964,39 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String resp = "{";
     resp += "\"ok\":true";
     resp += ",\"fw_version\":\"" + String(FW_VERSION) + "\"";
+    resp += ",\"fw_title\":\"" + jsonEscape(String(FW_TITLE)) + "\"";
     resp += ",\"peopleCount\":" + String(peopleCount);
     resp += ",\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
     resp += ",\"mqtt\":" + String(client.connected() ? "true" : "false");
     resp += ",\"distanceCm\":" + String(distanceStableCm);
-    resp += ",\"temperature\":" + String(currentTemp, 1);
-    resp += ",\"humidity\":" + String(currentHum, 1);
+    resp += ",\"dhtValid\":" + String((dhtValid && isDhtReadingPlausible(currentTemp, currentHum)) ? "true" : "false");
+
+    if (dhtValid && isDhtReadingPlausible(currentTemp, currentHum)) {
+      resp += ",\"temperature\":" + String(currentTemp, 1);
+      resp += ",\"humidity\":" + String(currentHum, 1);
+    }
+
     resp += ",\"uptimeSec\":" + String(millis() / 1000);
+    resp += ",\"bootCount\":" + String(bootCount);
     resp += "}";
 
-    sendRpcResponse(requestId, resp);
+    bool rpcOk = sendRpcResponse(requestId, resp);
+    Serial.println(rpcOk ? F("[RPC] getStatus response da gui") : F("[RPC] getStatus response gui that bai"));
+
+    // Đồng thời đẩy lại telemetry + attributes để dashboard cập nhật ngay,
+    // kể cả khi widget RPC không hiển thị response.
+    publishDeviceAttributes();
+    bool snapshotOk = publishStatusTelemetry("rpc_getStatus", true);
+
+    // Biến UX cho HTML dashboard: mỗi lần bấm Get HP04 Status phải đổi số RPC #.
+    publishRpcUiEvent("getStatus", (rpcOk && snapshotOk) ? "OK" : "FAILED",
+                      snapshotOk ? "Snapshot refreshed" : "Snapshot publish failed",
+                      "RPC:getStatus");
     return;
   }
 
   sendRpcResponse(requestId, "{\"ok\":false,\"error\":\"unknown_method\"}");
+  publishRpcUiEvent(method.length() > 0 ? method.c_str() : "unknown", "FAILED", "Unknown RPC method", "RPC:unknown");
 }
 
 // ================================================================================
@@ -974,15 +1032,26 @@ void readDhtIfDue(unsigned long now) {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
 
-    if (!isnan(t) && !isnan(h)) {
+    if (!isnan(t) && !isnan(h) && isDhtReadingPlausible(t, h)) {
       currentTemp = t;
       currentHum = h;
       dhtValid = true;
     } else {
-      dhtValid = false;
-      Serial.println(F("[DHT] Doc DHT11 that bai. Giu gia tri cu."));
+      // Không ghi đè currentTemp/currentHum bằng số rác.
+      // Nếu trước đó đã có giá trị tốt, dashboard vẫn giữ giá trị tốt gần nhất.
+      Serial.print(F("[DHT] Bo qua gia tri khong hop le: T="));
+      Serial.print(t);
+      Serial.print(F(" H="));
+      Serial.println(h);
     }
   }
+}
+
+bool isDhtReadingPlausible(float t, float h) {
+  if (isnan(t) || isnan(h)) return false;
+  if (t < DHT_VALID_TEMP_MIN_C || t > DHT_VALID_TEMP_MAX_C) return false;
+  if (h < DHT_VALID_HUM_MIN || h > DHT_VALID_HUM_MAX) return false;
+  return true;
 }
 
 // ================================================================================
@@ -1071,6 +1140,78 @@ void setBuzzer(bool on) {
 // 20. GỬI THINGSBOARD
 // ================================================================================
 
+bool publishStatusTelemetry(const char* reason, bool force) {
+  if (!client.connected()) return false;
+
+  unsigned long now = millis();
+
+  String payload = "{";
+  payload += "\"peopleCount\":" + String(peopleCount);
+  payload += ",\"distanceCm\":" + String(distanceStableCm);
+  payload += ",\"wifiRssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+  payload += ",\"uptimeSec\":" + String(now / 1000);
+  payload += ",\"bootCount\":" + String(bootCount);
+  payload += ",\"mqttConnected\":" + String(client.connected() ? "true" : "false");
+
+  if (dhtValid && isDhtReadingPlausible(currentTemp, currentHum)) {
+    payload += ",\"temperature\":" + String(currentTemp, 1);
+    payload += ",\"humidity\":" + String(currentHum, 1);
+  }
+
+  if (reason != nullptr && strlen(reason) > 0) {
+    payload += ",\"syncReason\":\"" + jsonEscape(String(reason)) + "\"";
+  }
+
+  payload += "}";
+
+  bool ok = client.publish("v1/devices/me/telemetry", payload.c_str());
+
+  if (ok) {
+    lastMqttSend = now;
+    needInstantSync = false;
+
+    if (force) {
+      Serial.println(F("[TB] Status snapshot da gui"));
+    } else {
+      Serial.println(F("[TB] Telemetry sync da gui"));
+    }
+  } else {
+    Serial.println(F("[TB] Gui telemetry/status snapshot that bai"));
+  }
+
+  return ok;
+}
+
+
+void publishRpcUiEvent(const char* method, const char* status, const char* message, const char* source) {
+  if (!client.connected()) return;
+
+  rpcUiSeq++;
+  syncUiSeq++;
+
+  String nowText = String(millis() / 1000UL) + "s";
+
+  StaticJsonDocument<512> doc;
+  doc["lastRpcSeq"] = rpcUiSeq;
+  doc["lastRpcMethod"] = method;
+  doc["lastRpcStatus"] = status;
+  doc["lastRpcMessage"] = message;
+  doc["lastRpcTime"] = nowText;
+  doc["lastRpcUptimeSec"] = (uint32_t)(millis() / 1000UL);
+
+  doc["lastSyncSeq"] = syncUiSeq;
+  doc["lastSyncSource"] = source;
+  doc["lastSyncTime"] = nowText;
+
+  char payload[512];
+  serializeJson(doc, payload);
+
+  bool ok = client.publish("v1/devices/me/telemetry", payload);
+
+  Serial.print(F("[TB] RPC UI event publish: "));
+  Serial.println(ok ? F("OK") : F("FAIL"));
+}
+
 void sendTelemetryIfDue(unsigned long now) {
   if (!client.connected()) return;
 
@@ -1079,38 +1220,9 @@ void sendTelemetryIfDue(unsigned long now) {
   bool passedCooldown = firstSend || (now - lastMqttSend >= MQTT_COOLDOWN_MS);
 
   if ((needInstantSync || duePeriodic || firstSend) && passedCooldown) {
-    String payload = "{";
-
-    payload += "\"peopleCount\":" + String(peopleCount);
-    payload += ",\"distanceCm\":" + String(distanceStableCm);
-    payload += ",\"wifiRssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
-    payload += ",\"uptimeSec\":" + String(now / 1000);
-    payload += ",\"bootCount\":" + String(bootCount);
-
-    if (dhtValid) {
-      payload += ",\"temperature\":" + String(currentTemp, 1);
-      payload += ",\"humidity\":" + String(currentHum, 1);
-    }
-
-    payload += "}";
-
-    bool ok = client.publish("v1/devices/me/telemetry", payload.c_str());
-
-    if (ok) {
-      if (needInstantSync) {
-        Serial.println(F("[TB] Instant sync da gui"));
-      } else {
-        Serial.println(F("[TB] Periodic sync da gui"));
-      }
-
-      lastMqttSend = now;
-      needInstantSync = false;
-    } else {
-      Serial.println(F("[TB] Gui telemetry that bai"));
-    }
+    publishStatusTelemetry(needInstantSync ? "instant" : "periodic", false);
   }
 }
-
 void publishDeviceAttributes() {
   if (!client.connected()) return;
 
@@ -1122,6 +1234,14 @@ void publishDeviceAttributes() {
   payload += ",\"device_model\":\"ESP32-C3_HP04\"";
   payload += ",\"bootCount\":" + String(bootCount);
   payload += ",\"resetReason\":\"" + jsonEscape(resetReasonToText()) + "\"";
+
+  // Tránh dashboard giữ mã lỗi OTA cũ như HTTP 404 sau khi thiết bị đã boot ổn.
+  // Khi có OTA thật, publishOtaStatus() sẽ ghi đè các trường này.
+  if (!otaPending && !otaRunning) {
+    payload += ",\"otaStatus\":\"IDLE\"";
+    payload += ",\"otaTargetVersion\":\"\"";
+    payload += ",\"otaDetail\":\"Ready for OTA command\"";
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     payload += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
@@ -1451,11 +1571,18 @@ void showBootScreen(const String& line1, const String& line2) {
 // 23. TIỆN ÍCH RPC / JSON / RESET REASON
 // ================================================================================
 
-void sendRpcResponse(const String& requestId, const String& response) {
-  if (!client.connected()) return;
+bool sendRpcResponse(const String& requestId, const String& response) {
+  if (!client.connected()) return false;
 
   String responseTopic = "v1/devices/me/rpc/response/" + requestId;
-  client.publish(responseTopic.c_str(), response.c_str());
+  bool ok = client.publish(responseTopic.c_str(), response.c_str());
+
+  Serial.print(F("[RPC] Response topic: "));
+  Serial.print(responseTopic);
+  Serial.print(F(" | ok="));
+  Serial.println(ok ? F("YES") : F("NO"));
+
+  return ok;
 }
 
 String extractRequestId(const String& topic) {

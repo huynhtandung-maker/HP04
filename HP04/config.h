@@ -28,7 +28,7 @@
 
 const char* APP_TITLE   = "HP04";
 const char* FW_TITLE    = "HP04_VISITOR_COUNTER";
-const char* FW_VERSION  = "v1.2.0-dev";
+const char* FW_VERSION  = "v1.2.0";
 const char* FW_NOTE     = "Hiểu version và update OTA biến";
 
 // Bật/tắt OTA qua GitHub URL do ThingsBoard gửi xuống.
