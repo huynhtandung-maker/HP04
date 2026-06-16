@@ -28,8 +28,8 @@
 
 const char* APP_TITLE   = "HP04";
 const char* FW_TITLE    = "HP04_VISITOR_COUNTER";
-const char* FW_VERSION  = "v1.1.0";
-const char* FW_NOTE     = "Non-blocking WiFi/MQTT, OLED layout upgrade, RPC GitHub OTA";
+const char* FW_VERSION  = "v1.2.0";
+const char* FW_NOTE     = "Hiểu version và update OTA biến";
 
 // Bật/tắt OTA qua GitHub URL do ThingsBoard gửi xuống.
 // Nếu chưa dùng OTA, để false để tránh bấm nhầm từ xa.
