@@ -164,25 +164,30 @@ const unsigned long SERIAL_LOG_INTERVAL_MS = 1000;
 
 // Delay rất nhỏ để nhường CPU, không dùng delay dài.
 const unsigned long LOOP_IDLE_DELAY_MS = 5;
-
 // ================================================================================
-// 9. CẤU HÌNH RUNTIME CONFIG / PROVISIONING - v1.2.0-dev
+// 9. CẤU HÌNH RUNTIME CONFIG / SETUP PORTAL - v1.2.0-dev
 // ================================================================================
 
-// Giai đoạn chuyển tiếp:
-// 1 = vẫn cho phép lấy WiFi/token từ secrets.h nếu trong NVS chưa có cấu hình.
-// 0 = firmware production không include secrets.h.
+// Giai đoạn phát triển:
+// 1 = nếu NVS chưa có config thì dùng secrets.h dự phòng.
+// 0 = firmware sạch secret, nếu chưa có config thì mở Setup Portal.
 #define USE_LOCAL_SECRETS 1
 
-// Namespace lưu WiFi/token trong Preferences/NVS.
+// Namespace lưu cấu hình runtime trong Preferences/NVS
 #define CFG_NAMESPACE "hp04_cfg"
 
-// ThingsBoard mặc định.
+// ThingsBoard mặc định
 #define DEFAULT_TB_HOST "thingsboard.cloud"
 #define DEFAULT_TB_PORT 1883
 
-// Tên WiFi AP sau này dùng cho Setup Portal.
+// Setup Portal WiFi AP
 #define SETUP_AP_PREFIX "HP04-SETUP"
 
-// Sau này nếu WiFi lỗi quá lâu thì mở Setup Portal.
+// Mật khẩu AP cấu hình, tối thiểu 8 ký tự
+#define SETUP_AP_PASSWORD "hp04setup"
+
+// Web portal chạy tại http://192.168.4.1
+#define SETUP_PORTAL_PORT 80
+
+// Nếu sau này WiFi lỗi quá lâu thì mở setup portal
 const unsigned long WIFI_FAIL_TO_SETUP_MS = 60000; // 60 giây

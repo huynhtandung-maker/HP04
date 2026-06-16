@@ -27,6 +27,7 @@
 */
 
 #include <WiFi.h>
+#include <WebServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
@@ -44,7 +45,6 @@
 #include "esp_system.h"
 
 #include "config.h"
-
 #if USE_LOCAL_SECRETS
   #include "secrets.h"
 #endif
@@ -79,6 +79,8 @@ bool setupPortalActive = false;
 unsigned long wifiConnectStartedAt = 0;
 WiFiClient espClient;
 PubSubClient client(espClient);
+WebServer setupServer(SETUP_PORTAL_PORT);
+
 
 Adafruit_NeoPixel pixels(NUMPIXELS, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 DHT dht(DHTPIN, DHTTYPE);
@@ -134,6 +136,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void loadRuntimeConfig();
 bool isRuntimeConfigValid();
 void printRuntimeConfigStatus();
+
+String getSetupApName();
+void startSetupPortal();
+void maintainSetupPortal();
+void handleSetupRoot();
+void handleSetupSave();
 
 long readDistanceCm();
 void readDhtIfDue(unsigned long now);
@@ -216,6 +224,150 @@ void printRuntimeConfigStatus() {
 }
 
 // ================================================================================
+// 12B. SETUP PORTAL - WIFI / THINGSBOARD CONFIG
+// ================================================================================
+
+String getSetupApName() {
+  uint32_t chipId = (uint32_t)ESP.getEfuseMac();
+  String suffix = String(chipId, HEX);
+  suffix.toUpperCase();
+
+  if (suffix.length() > 4) {
+    suffix = suffix.substring(suffix.length() - 4);
+  }
+
+  return String(SETUP_AP_PREFIX) + "-" + suffix;
+}
+
+void startSetupPortal() {
+  if (setupPortalActive) return;
+
+  String apName = getSetupApName();
+
+  Serial.println(F("[SETUP] Bat dau Setup Portal"));
+  Serial.print(F("[SETUP] AP SSID: "));
+  Serial.println(apName);
+  Serial.println(F("[SETUP] Mo trinh duyet: http://192.168.4.1"));
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apName.c_str(), SETUP_AP_PASSWORD);
+
+  setupServer.on("/", HTTP_GET, handleSetupRoot);
+  setupServer.on("/save", HTTP_POST, handleSetupSave);
+  setupServer.begin();
+
+  setupPortalActive = true;
+
+  if (oledReady) {
+    display.clearDisplay();
+    display.setTextColor(SH110X_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println(F("HP04 SETUP MODE"));
+    display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+    display.setCursor(0, 18);
+    display.print(F("AP: "));
+    display.println(apName);
+    display.setCursor(0, 34);
+    display.println(F("Pass: hp04setup"));
+    display.setCursor(0, 50);
+    display.println(F("IP: 192.168.4.1"));
+    display.display();
+  }
+}
+
+void maintainSetupPortal() {
+  if (setupPortalActive) {
+    setupServer.handleClient();
+  }
+}
+
+void handleSetupRoot() {
+  String html = "";
+
+  html += "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>HP04 Setup</title>";
+  html += "<style>";
+  html += "body{font-family:Arial;background:#0f172a;color:#fff;margin:0;padding:24px;}";
+  html += ".card{max-width:520px;margin:auto;background:#111827;border:1px solid #334155;border-radius:18px;padding:24px;}";
+  html += "h1{margin-top:0;font-size:26px;}";
+  html += "label{display:block;margin-top:14px;color:#cbd5e1;font-weight:bold;}";
+  html += "input{width:100%;box-sizing:border-box;margin-top:6px;padding:12px;border-radius:10px;border:1px solid #475569;background:#020617;color:#fff;font-size:16px;}";
+  html += "button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:12px;background:#22c55e;color:#052e16;font-size:17px;font-weight:bold;}";
+  html += ".note{color:#94a3b8;font-size:13px;line-height:1.5;margin-top:12px;}";
+  html += "</style></head><body>";
+  html += "<div class='card'>";
+  html += "<h1>HP04 Setup Portal</h1>";
+  html += "<div class='note'>Nhap WiFi va ThingsBoard token cho thiet bi. Thong tin se duoc luu trong Preferences/NVS.</div>";
+  html += "<form method='POST' action='/save'>";
+
+  html += "<label>WiFi SSID</label>";
+  html += "<input name='wifi_ssid' placeholder='Ten WiFi' required>";
+
+  html += "<label>WiFi Password</label>";
+  html += "<input name='wifi_pass' type='password' placeholder='Mat khau WiFi'>";
+
+  html += "<label>ThingsBoard Host</label>";
+  html += "<input name='tb_host' value='thingsboard.cloud' required>";
+
+  html += "<label>ThingsBoard Port</label>";
+  html += "<input name='tb_port' value='1883' required>";
+
+  html += "<label>ThingsBoard Device Token</label>";
+  html += "<input name='tb_token' placeholder='Access token cua thiet bi' required>";
+
+  html += "<button type='submit'>Save & Restart HP04</button>";
+  html += "</form>";
+  html += "</div></body></html>";
+
+  setupServer.send(200, "text/html", html);
+}
+
+void handleSetupSave() {
+  String ssid = setupServer.arg("wifi_ssid");
+  String pass = setupServer.arg("wifi_pass");
+  String host = setupServer.arg("tb_host");
+  String portText = setupServer.arg("tb_port");
+  String token = setupServer.arg("tb_token");
+
+  ssid.trim();
+  pass.trim();
+  host.trim();
+  portText.trim();
+  token.trim();
+
+  int port = portText.toInt();
+  if (port <= 0) port = DEFAULT_TB_PORT;
+
+  if (ssid.length() == 0 || token.length() < 5) {
+    setupServer.send(400, "text/plain", "Missing WiFi SSID or ThingsBoard token");
+    return;
+  }
+
+  configPrefs.putString("wifi_ssid", ssid);
+  configPrefs.putString("wifi_pass", pass);
+  configPrefs.putString("tb_host", host.length() > 0 ? host : DEFAULT_TB_HOST);
+  configPrefs.putInt("tb_port", port);
+  configPrefs.putString("tb_token", token);
+
+  setupServer.send(
+    200,
+    "text/html",
+    "<html><body style='font-family:Arial;padding:24px;'>"
+    "<h2>HP04 saved configuration</h2>"
+    "<p>Device will restart now.</p>"
+    "</body></html>"
+  );
+
+  Serial.println(F("[SETUP] Da luu WiFi/ThingsBoard config vao NVS. Restart..."));
+
+  delay(1200);
+  ESP.restart();
+}
+
+
+// ================================================================================
 // 13. SETUP
 // ================================================================================
 
@@ -259,12 +411,13 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
   if (hasRuntimeConfig) {
+  WiFi.mode(WIFI_STA);
   WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPassword.c_str());
   wifiConnectStartedAt = millis();
   lastWifiAttempt = wifiConnectStartedAt;
-  } else {
-  Serial.println(F("[CFG] Chua co WiFi/token. Setup Portal se duoc them o buoc tiep theo."));
-  }
+} else {
+  startSetupPortal();
+}
 
   client.setServer(cfgTbHost.c_str(), cfgTbPort);
   client.setCallback(mqttCallback);
@@ -288,6 +441,8 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  maintainSetupPortal();
 
   maintainWiFi(now);
   maintainMqtt(now);
