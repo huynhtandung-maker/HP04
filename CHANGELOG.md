@@ -21,7 +21,23 @@ v1.1.0
 * `PATCH`: sửa lỗi nhỏ, tối ưu ổn định, không đổi hành vi chính.
 
 ***
+## [v1.2.0] - 2026-06-16
 
+### Added
+- Runtime WiFi and ThingsBoard configuration through local setup portal.
+- RPC getStatus response telemetry for clearer dashboard feedback.
+- Last RPC sequence, status, method, message, and sync telemetry.
+- OTA status, target version, OTA detail, IP, MAC, boot count, and reset reason telemetry.
+
+### Changed
+- Improved ThingsBoard dashboard UX to show device reaction after button press.
+- Reduced dependency on hardcoded WiFi and ThingsBoard credentials.
+- Improved MQTT reconnect and status reporting.
+
+### Security
+- secrets.h remains local only and must not be committed.
+- secrets.example.h is provided as a safe template.
+- Firmware binary for public release must be built without embedded real secrets.
 ## v1.1.0 - 2026-06-16
 
 ### Added
